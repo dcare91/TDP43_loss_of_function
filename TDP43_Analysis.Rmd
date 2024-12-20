@@ -1,0 +1,1794 @@
+
+---
+title: "TDP43 Analysis"
+author: "Davide Caredio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+library(sva)
+library(DESeq2)
+library(ggrepel)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(eulerr)
+library(ggvenn)
+library(impute)
+library(preprocessCore)
+library(WGCNA)
+library(patchwork)
+library(openxlsx)
+library(igraph)
+library(scales)
+library(writexl)
+```
+
+# File Setup
+
+```{r file-setup}
+setwd("~/USZ/Neuropathologie - Caredio Davide/Collaborations/For_Carlo")
+file_1 <- "result--Atto--over--Negative.xlsx"
+file_2 <- "result--mScarlet--over--Atto.xlsx"
+file_3 <- "result--mScarlet--over--Negative.xlsx"
+data_atto_over_negative <- read_excel(file_1)
+data_mscarlet_over_atto <- read_excel(file_2)
+data_mscarlet_over_negative <- read_excel(file_3)
+```
+
+# Data Preparation
+
+```{r data-preparation}
+# Data filtering and cleaning steps
+data_atto_over_negative_filtered <- data_atto_over_negative %>%
+  dplyr::select(1, 3, 4, 5, 14, 15, 16, 22:27)
+data_mscarlet_over_atto_filtered <- data_mscarlet_over_atto %>%
+  dplyr::select(1, 3, 4, 5, 14, 15, 16, 22:24, 28:30)
+data_mscarlet_over_negative_filtered <- data_mscarlet_over_negative %>%
+  dplyr::select(1, 3, 4, 5, 14, 15, 16, 25:30)
+
+data_atto_over_negative_filtered <- data_atto_over_negative_filtered %>%
+  filter(type == "protein_coding")
+
+data_mscarlet_over_atto_filtered <- data_mscarlet_over_atto_filtered %>%
+  filter(type == "protein_coding")
+
+data_mscarlet_over_negative_filtered <- data_mscarlet_over_negative_filtered %>%
+  filter(type == "protein_coding")
+```
+
+# Data Merging and Transformation
+
+```{r data-merging}
+negative_data <- data_mscarlet_over_negative_filtered %>%
+  dplyr::select(gene_id, `Negative_1 [normalized count]`, `Negative_2 [normalized count]`, `Negative_3 [normalized count]`)
+
+atto_data <- data_atto_over_negative_filtered %>%
+  dplyr::select(gene_id, `Atto_1 [normalized count]`, `Atto_2 [normalized count]`, `Atto_3 [normalized count]`)
+
+mscarlet_data <- data_mscarlet_over_atto_filtered %>%
+  dplyr::select(gene_id, `mScarlet_1 [normalized count]`, `mScarlet_2 [normalized count]`, `mScarlet_3 [normalized count]`)
+
+merged_data <- negative_data %>%
+  full_join(atto_data, by = "gene_id") %>%
+  full_join(mscarlet_data, by = "gene_id")
+
+# # Loop through each column (excluding the first column which is gene_id)
+# for (col_name in colnames(merged_data)[-1]) {
+#   # Extract the gene_id and the specific column
+#   subset_data <- merged_data[, c("gene_id", col_name)]
+#   
+#   # Clean the column name to create a valid file name (remove special characters and spaces)
+#   clean_col_name <- gsub("[^a-zA-Z0-9]", "_", col_name)
+#   
+#   # Create the file name
+#   file_name <- paste0("gene_data_", clean_col_name, ".csv")
+#   
+#   # Save the data to a CSV file
+#   write.csv(subset_data, file = file_name, row.names = FALSE)
+#   
+#   # Print a message for confirmation
+#   cat("Saved file:", file_name, "\n")
+# }
+```
+
+# Quality Control Plots
+
+```{r exploratory-plots}
+merged_data <- merged_data %>%
+  mutate(
+    Average_Negative = rowMeans(dplyr::select(., starts_with("Negative")), na.rm = TRUE),
+    Average_Atto = rowMeans(dplyr::select(., starts_with("Atto")), na.rm = TRUE),
+    Average_mScarlet = rowMeans(dplyr::select(., starts_with("mScarlet")), na.rm = TRUE)
+  )
+plot_data <- merged_data %>%
+  pivot_longer(
+    cols = -c(gene_id, Average_Negative, Average_Atto, Average_mScarlet),
+    names_to = "Replicate",
+    values_to = "Normalized_Count"
+  ) %>%
+  mutate(
+    Group = case_when(
+      str_starts(Replicate, "Negative") ~ "Negative",
+      str_starts(Replicate, "Atto") ~ "Atto",
+      str_starts(Replicate, "mScarlet") ~ "mScarlet"
+    ),
+    Average = case_when(
+      Group == "Negative" ~ Average_Negative,
+      Group == "Atto" ~ Average_Atto,
+      Group == "mScarlet" ~ Average_mScarlet
+    ),
+    Replicate = gsub("\\[normalized count\\]", "", Replicate),
+    Average = Average + 1,
+    Normalized_Count = Normalized_Count + 1
+  )
+p <- ggplot(plot_data, aes(x = Average, y = Normalized_Count)) +
+  geom_point(alpha = 0.2, color = "grey", size = 0.5) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) + 
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  facet_wrap(
+    ~ Replicate,
+    ncol = 3,
+    scales = "free",
+    labeller = as_labeller(function(rep) {
+      group <- plot_data %>% filter(Replicate == rep) %>% pull(Group) %>% unique()
+      paste0("Y: ", rep, "\nX: Average ", group, " Counts")
+    })
+  ) +
+  scale_x_log10(labels = scales::math_format(10^.x)) +
+  scale_y_log10(labels = scales::math_format(10^.x)) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_blank(),
+    strip.text = element_text(size = 12, face = "bold")
+  )
+print(p)
+
+#ggsave("replicate_vs_average_custom_labels.tiff", plot = p, width = 8, height = 6, dpi = 300)
+
+pca_data <- merged_data %>%
+  dplyr::select(starts_with("Negative"), starts_with("Atto"), starts_with("mScarlet")) %>%
+  as.matrix()
+pca_data_filtered <- pca_data[apply(pca_data, 1, var) > 0, ]
+top_features <- head(order(apply(pca_data_filtered, 1, var), decreasing = TRUE), 2000)
+pca_data_top_2000 <- pca_data_filtered[top_features, ]
+
+pca_result <- prcomp(t(pca_data_top_2000), scale. = TRUE)
+
+pca_plot_data <- as.data.frame(pca_result$x) %>%
+  mutate(Sample = rownames(pca_result$x)) %>%
+  mutate(
+    Group = case_when(
+      grepl("Negative", Sample) ~ "Negative",
+      grepl("Atto", Sample) ~ "Atto",
+      grepl("mScarlet", Sample) ~ "mScarlet"
+    )
+  )
+
+p <- ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 4, alpha = 0.8) + 
+  labs(
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2, 1] * 100, 1), "% variance)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2, 2] * 100, 1), "% variance)"),
+    title = "PCA Plot"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Negative" = "grey70",       
+      "Atto" = "darkgoldenrod1",   
+      "mScarlet" = "red"           
+    )
+  ) +
+  theme_minimal(base_size = 11) + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 11, face = "bold"), 
+    axis.title = element_text(size = 11, face = "bold"),           
+    axis.text = element_text(size = 11),                           
+    legend.position = "top",                                      
+    legend.title = element_blank(),                           
+    legend.text = element_text(size = 11),                        
+    panel.grid.major = element_line(color = "grey90"),              
+    panel.grid.minor = element_blank()                            
+  )
+
+print(p)
+
+#ggsave("PCA_Plot_No_BatchCorrected.tiff", plot = p, width = 3.5, height = 3.5, dpi = 300)
+
+#Batch Corrected
+pca_data <- merged_data %>%
+  dplyr::select(starts_with("Negative"), starts_with("Atto"), starts_with("mScarlet")) %>%
+  as.matrix()
+
+pca_data_filtered <- pca_data[apply(pca_data, 1, var) > 0, ]
+
+top_features <- head(order(apply(pca_data_filtered, 1, var), decreasing = TRUE), 2000)
+pca_data_top_2000 <- pca_data_filtered[top_features, ]
+
+batch <- c(rep(1, 3), rep(2, 3), rep(3, 3)) 
+colnames(pca_data_top_2000) <- c("Negative_1", "Atto_1", "mScarlet_1",
+                                 "Negative_2", "Atto_2", "mScarlet_2",
+                                 "Negative_3", "Atto_3", "mScarlet_3")
+
+batch_corrected_data <- ComBat(
+  dat = pca_data_top_2000,
+  batch = batch,
+  mod = NULL, 
+  par.prior = TRUE,
+  prior.plots = FALSE
+)
+
+pca_result <- prcomp(t(batch_corrected_data), scale. = TRUE)
+
+pca_plot_data <- as.data.frame(pca_result$x) %>%
+  mutate(Sample = rownames(pca_result$x)) %>%
+  mutate(
+    Group = case_when(
+      grepl("Negative", Sample) ~ "Negative",
+      grepl("Atto", Sample) ~ "Atto",
+      grepl("mScarlet", Sample) ~ "mScarlet"
+    )
+  )
+
+p <- ggplot(pca_plot_data, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 4, alpha = 0.8) +
+  labs(
+    x = paste0("PC1 (", round(summary(pca_result)$importance[2, 1] * 100, 1), "% variance)"),
+    y = paste0("PC2 (", round(summary(pca_result)$importance[2, 2] * 100, 1), "% variance)"),
+    title = "PCA Plot (Batch-Corrected)"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Negative" = "grey70",
+      "Atto" = "darkgoldenrod1",
+      "mScarlet" = "red"
+    )
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 11, face = "bold"), 
+    axis.title = element_text(size = 11, face = "bold"),             
+    axis.text = element_text(size = 11),                            
+    legend.position = "top",                                        
+    legend.title = element_blank(),                                 
+    legend.text = element_text(size = 11),                         
+    panel.grid.major = element_line(color = "grey90"),              
+    panel.grid.minor = element_blank()                              
+  )
+
+print(p)
+
+#ggsave("PCA_Plot_BatchCorrected.tiff", plot = p, width = 3.5, height = 3.5, dpi = 300)
+
+```
+
+# Prepare Raw Count Matrix
+
+```{r count-matrix}
+valid_gene_ids <- merged_data$gene_id[grepl("^ENS", merged_data$gene_id)]
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")  
+gene_mapping <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = valid_gene_ids,
+  mart = ensembl
+)
+
+gene_mapping <- gene_mapping %>%
+  distinct(ensembl_gene_id, .keep_all = TRUE)
+
+raw_counts <- merged_data %>%
+  dplyr::select(starts_with("Negative"), starts_with("Atto"), starts_with("mScarlet")) %>%
+  as.matrix()
+raw_counts <- round(raw_counts)
+gene_mapping_table <- setNames(gene_mapping$hgnc_symbol, gene_mapping$ensembl_gene_id)
+rownames(raw_counts) <- merged_data$gene_id
+rownames(raw_counts) <- ifelse(
+  rownames(raw_counts) %in% names(gene_mapping_table),
+  gene_mapping_table[rownames(raw_counts)],
+  rownames(raw_counts)
+)
+rownames(raw_counts) <- ifelse(
+  grepl("^X\\.", rownames(raw_counts)), 
+  merged_data$gene_id[match(rownames(raw_counts), merged_data$gene_id)], 
+  rownames(raw_counts)
+)
+head(raw_counts)
+table(is.na(rownames(raw_counts))) 
+
+threshold <- 20
+
+filtered_raw_counts <- raw_counts[rowSums(raw_counts >= threshold) == ncol(raw_counts), ]
+cat("Original number of genes:", nrow(raw_counts), "\n")
+cat("Number of genes after filtering:", nrow(filtered_raw_counts), "\n")
+head(filtered_raw_counts)
+
+```
+
+# Differential Expression Analysis
+
+```{r differential-expression}
+metadata <- data.frame(
+  Sample = colnames(filtered_raw_counts),
+  Condition = c(rep("Negative", 3), rep("Atto", 3), rep("mScarlet", 3)),
+  Batch = rep(1:3, each = 3)
+)
+
+metadata <- metadata %>%
+  mutate(
+    BatchCondition = factor(paste(Batch, Condition, sep = "_"))
+  )
+rownames(metadata) <- metadata$Sample
+
+dds <- DESeqDataSetFromMatrix(
+  countData = filtered_raw_counts,
+  colData = metadata,
+  design = ~ BatchCondition
+)
+
+dds <- DESeq(dds)
+
+results_atto_vs_negative <- results(dds, contrast = c("BatchCondition", "2_Atto", "1_Negative"))
+results_mscarlet_vs_negative <- results(dds, contrast = c("BatchCondition", "3_mScarlet", "1_Negative"))
+results_mscarlet_vs_atto <- results(dds, contrast = c("BatchCondition", "3_mScarlet", "2_Atto"))
+
+clean_DESeqResults <- function(results_object) {
+  results_df <- as.data.frame(results_object)
+  results_df$Gene <- rownames(results_object)
+  print("Rows with problematic Gene values:")
+  print(head(results_df[grepl("^\\.", results_df$Gene) | results_df$Gene == "", ]))
+  results_cleaned <- results_df[!(grepl("^\\.", results_df$Gene) | results_df$Gene == ""), ]
+  print("Remaining problematic rows after filtering (should be empty):")
+  print(head(results_cleaned[grepl("^\\.", results_cleaned$Gene) | results_cleaned$Gene == "", ]))
+  rownames(results_cleaned) <- results_cleaned$Gene
+  results_cleaned$Gene <- NULL
+  return(results_cleaned)
+}
+
+results_mscarlet_vs_atto <- clean_DESeqResults(results_mscarlet_vs_atto)
+results_mscarlet_vs_negative <- clean_DESeqResults(results_mscarlet_vs_negative)
+results_atto_vs_negative <- clean_DESeqResults(results_atto_vs_negative)
+
+# write.xlsx(
+#   list(
+#     "mscarlet_vs_atto" = results_mscarlet_vs_atto,
+#     "mscarlet_vs_negative" = results_mscarlet_vs_negative,
+#     "atto_vs_negative" = results_atto_vs_negative
+#   ),
+#   file = "cleaned_DEGs_results.xlsx"
+# )
+
+
+# # Volcano Plot Function
+# volcano_plot <- function(results, title) {
+#   results <- as.data.frame(results)
+#   results <- results %>%
+#     mutate(
+#       Gene = rownames(results),  # Gene names are now available
+#       Regulation = case_when(
+#         padj < 0.05 & log2FoldChange > 0.5 ~ "Upregulated",
+#         padj < 0.05 & log2FoldChange < -0.5 ~ "Downregulated",
+#         TRUE ~ "Not Significant"
+#       )
+#     )
+#   
+#   ggplot(results, aes(x = log2FoldChange, y = -log10(pvalue), color = Regulation)) +
+#     geom_point(alpha = 0.6, size = 2) +
+#     scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "cyan", "Not Significant" = "grey")) +
+#     geom_text_repel(
+#       data = results %>% filter(Regulation == "Upregulated"),
+#       aes(label = Gene),
+#       size = 3,
+#       max.overlaps = 10
+#     ) +
+#     geom_text_repel(
+#       data = results %>% filter(Regulation == "Downregulated"),
+#       aes(label = Gene),
+#       size = 3,
+#       max.overlaps = 10
+#     ) +
+#     labs(
+#       x = "Log2 Fold Change",
+#       y = "-Log10 P-value",
+#       title = title
+#     ) +
+#     theme_minimal() +
+#     theme(
+#       plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+#       axis.text = element_text(size = 12),
+#       axis.title = element_text(size = 14),
+#       legend.title = element_blank(),
+#       legend.position = "top"
+#     )
+# }
+# 
+# # Volcano Plots
+# volcano_plot(results_atto_vs_negative, "Volcano Plot: Atto vs Negative")
+# volcano_plot(results_mscarlet_vs_negative, "Volcano Plot: mScarlet vs Negative")
+# volcano_plot(results_mscarlet_vs_atto, "Volcano Plot: mScarlet vs Atto")
+
+prepare_results <- function(results, comparison_name) {
+  results <- as.data.frame(results)
+  
+  if (!"Gene" %in% colnames(results)) {
+    results <- results %>%
+      rownames_to_column(var = "Gene") 
+  }
+  
+  results <- results %>%
+    mutate(
+      Regulation = case_when(
+        padj < 0.05 & log2FoldChange > 0.5 ~ "Upregulated",
+        padj < 0.05 & log2FoldChange < -0.5 ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      ),
+      Comparison = comparison_name
+    )
+  
+  return(results)
+}
+
+# Prepare results for each comparison
+results_atto_vs_negative <- prepare_results(results_atto_vs_negative, "Atto vs Negative")
+results_mscarlet_vs_negative <- prepare_results(results_mscarlet_vs_negative, "mScarlet vs Negative")
+results_mscarlet_vs_atto <- prepare_results(results_mscarlet_vs_atto, "mScarlet vs Atto")
+
+# Combine all results into one data frame
+all_results <- bind_rows(
+  results_atto_vs_negative,
+  results_mscarlet_vs_negative,
+  results_mscarlet_vs_atto
+)
+
+# Count the number of upregulated and downregulated genes for each comparison
+counts_summary <- all_results %>%
+  group_by(Comparison, Regulation) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  filter(Regulation %in% c("Upregulated", "Downregulated")) %>%
+  pivot_wider(names_from = Regulation, values_from = Count, values_fill = 0) %>%
+  mutate(Label = paste0("Up: ", Upregulated, "\nDown: ", Downregulated))
+
+
+all_results <- all_results %>%
+  mutate(
+    SpecificLabel = ifelse(Gene %in% c("ATXN2", "STMN2", "SQSTM1", "TUBA4A", "WNT5A", "SOX6"), Gene, NA),
+    CombinedLabel = ifelse(!is.na(SpecificLabel) | Regulation %in% c("Upregulated", "Downregulated"), Gene, NA),
+    Highlight = ifelse(!is.na(SpecificLabel), "Specific", Regulation) 
+  )
+
+facet_volcanos <- ggplot(all_results, aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(color = Highlight), alpha = 0.6, size = 2) +
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "grey", "Specific" = "green")) +
+  geom_point(
+    data = all_results %>% filter(!is.na(SpecificLabel)),
+    aes(x = log2FoldChange, y = -log10(pvalue), color = Highlight),
+    size = 2,
+    inherit.aes = FALSE
+  ) +
+  geom_text_repel(
+    data = all_results %>% filter(!is.na(SpecificLabel)),
+    aes(label = SpecificLabel),
+    size = 3,
+    segment.color = "black",
+    segment.size = 0.5
+  ) +
+  geom_text_repel(
+    data = all_results %>% filter(!is.na(CombinedLabel) & is.na(SpecificLabel)),
+    aes(label = Gene),
+    size = 3,
+    segment.color = "black",
+    segment.size = 0.5
+  ) +
+  geom_text(
+    data = counts_summary,
+    aes(x = -6.5, y = max(-log10(all_results$pvalue), na.rm = TRUE), label = Label),
+    inherit.aes = FALSE,
+    size = 4,
+    hjust = 0
+  ) +
+  labs(
+    x = "Log2 Fold Change",
+    y = "-Log10 P-value",
+    title = "Volcano Plots for all the Comparisons"
+  ) +
+  facet_wrap(
+    ~ Comparison,
+    scales = "fixed", 
+    labeller = label_both 
+  ) +
+  scale_x_continuous(limits = c(-7, 7)) + 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    legend.title = element_blank(),
+    legend.position = "top",
+    strip.text = element_text(size = 12, face = "bold")
+  )
+
+# svg("facet_volcanos.svg", width = 4.5, height = 5)
+print(facet_volcanos)
+# dev.off()
+
+
+```
+
+# Venn Diagrams
+
+```{r venn diagrams}
+
+# # Step 1: Extract DEGs for each comparison
+# degs_atto_vs_negative <- all_results %>%
+#   filter(Comparison == "Atto vs Negative" & abs(log2FoldChange) > 0.5 & padj < 0.05) %>%
+#   pull(Gene)
+# 
+# degs_mscarlet_vs_negative <- all_results %>%
+#   filter(Comparison == "mScarlet vs Negative" & abs(log2FoldChange) > 0.5 & padj < 0.05) %>%
+#   pull(Gene)
+# 
+# degs_mscarlet_vs_atto <- all_results %>%
+#   filter(Comparison == "mScarlet vs Atto" & abs(log2FoldChange) > 0.5 & padj < 0.05) %>%
+#   pull(Gene)
+# 
+# # Step 2: Prepare list for Venn Diagram
+# venn_data <- list(
+#   `Atto vs Negative` = degs_atto_vs_negative,
+#   `mScarlet vs Negative` = degs_mscarlet_vs_negative,
+#   `mScarlet vs Atto` = degs_mscarlet_vs_atto
+# )
+# 
+# # Step 3: Plot Venn Diagram
+# ggvenn(
+#   venn_data,
+#   fill_color = c("#F8766D", "#00BFC4", "#7CAE00"),
+#   stroke_size = 0.5,
+#   set_name_size = 4,
+#   text_size = 4
+# )
+
+
+degs_atto_vs_negative <- all_results %>%
+  filter(Comparison == "Atto vs Negative" & padj < 0.05 & abs(log2FoldChange) > 0.5) %>%
+  pull(Gene)
+
+degs_mscarlet_vs_negative <- all_results %>%
+  filter(Comparison == "mScarlet vs Negative" & padj < 0.05 & abs(log2FoldChange) > 0.5) %>%
+  pull(Gene)
+
+degs_mscarlet_vs_atto <- all_results %>%
+  filter(Comparison == "mScarlet vs Atto" & padj < 0.05 & abs(log2FoldChange) > 0.5) %>%
+  pull(Gene)
+
+venn_data <- list(
+  `Atto vs Negative` = degs_atto_vs_negative,
+  `mScarlet vs Negative` = degs_mscarlet_vs_negative,
+  `mScarlet vs Atto` = degs_mscarlet_vs_atto
+)
+
+venn_plot <- euler(venn_data)
+venn_diagram <- plot(venn_plot,
+     fills = c("#F8766D", "#00BFC4", "#7CAE00"),
+     edges = list(lwd = 1.5),
+     labels = list(cex = 1.2),
+     quantities = TRUE)
+
+# svg("venn_diagram.svg", width = 3.5, height = 3.5)
+# print(venn_diagram)
+# dev.off()
+
+
+degs_atto_vs_negative_up <- all_results %>%
+  filter(Comparison == "Atto vs Negative" & padj < 0.05 & log2FoldChange > 0.5) %>%
+  pull(Gene)
+
+degs_atto_vs_negative_down <- all_results %>%
+  filter(Comparison == "Atto vs Negative" & padj < 0.05 & log2FoldChange < -0.5) %>%
+  pull(Gene)
+
+degs_mscarlet_vs_negative_up <- all_results %>%
+  filter(Comparison == "mScarlet vs Negative" & padj < 0.05 & log2FoldChange > 0.5) %>%
+  pull(Gene)
+
+degs_mscarlet_vs_negative_down <- all_results %>%
+  filter(Comparison == "mScarlet vs Negative" & padj < 0.05 & log2FoldChange < -0.5) %>%
+  pull(Gene)
+
+degs_mscarlet_vs_atto_up <- all_results %>%
+  filter(Comparison == "mScarlet vs Atto" & padj < 0.05 & log2FoldChange > 0.5) %>%
+  pull(Gene)
+
+degs_mscarlet_vs_atto_down <- all_results %>%
+  filter(Comparison == "mScarlet vs Atto" & padj < 0.05 & log2FoldChange < -0.5) %>%
+  pull(Gene)
+
+venn_data_up <- list(
+  `Atto vs Negative` = degs_atto_vs_negative_up,
+  `mScarlet vs Negative` = degs_mscarlet_vs_negative_up,
+  `mScarlet vs Atto` = degs_mscarlet_vs_atto_up
+)
+
+venn_data_down <- list(
+  `Atto vs Negative` = degs_atto_vs_negative_down,
+  `mScarlet vs Negative` = degs_mscarlet_vs_negative_down,
+  `mScarlet vs Atto` = degs_mscarlet_vs_atto_down
+)
+
+venn_plot_up <- euler(venn_data_up)
+venn_plot_down <- euler(venn_data_down)
+
+venn_diagram_up <- plot(venn_plot_up, 
+     fills = c("#F7726D", "#F43028", "#AA0308"), 
+     edges = list(lwd = 1.5),
+     labels = list(cex = 1.2),
+     quantities = TRUE,
+     main = "Upregulated Genes")
+
+# svg("venn_diagram_up.svg", width = 3.5, height = 3.5)
+# print(venn_diagram_up)
+# dev.off()
+
+venn_diagram_down <- plot(venn_plot_down, 
+     fills = c("#91B8F7", "#2c78f0", "#0b47a7"), 
+     edges = list(lwd = 1.5),
+     labels = list(cex = 1.2),
+     quantities = TRUE,
+     main = "Downregulated Genes")
+
+# svg("venn_diagram_down.svg", width = 3.5, height = 3.5)
+# print(venn_diagram_down)
+# dev.off()
+
+```
+
+# Functional Analysis
+
+```{r kegg and geo analysis}
+prepare_gene_list <- function(all_results, comparison_name, regulation) {
+  all_results %>%
+    filter(Comparison == comparison_name & Regulation == regulation) %>%
+    pull(Gene) %>% 
+    unique() 
+}
+
+comparisons <- unique(all_results$Comparison)
+regulations <- c("Upregulated", "Downregulated", "Both")
+
+results_ora_kegg <- list()
+
+for (comparison in comparisons) {
+  for (regulation in regulations) {
+    gene_list <- if (regulation == "Both") {
+      all_results %>%
+        filter(Comparison == comparison & Regulation %in% c("Upregulated", "Downregulated")) %>%
+        pull(Gene) %>%
+        unique()
+    } else {
+      prepare_gene_list(all_results, comparison, regulation)
+    }
+    
+    if (length(gene_list) == 0) next
+    
+    ora <- enrichGO(
+      gene = gene_list,
+      OrgDb = org.Hs.eg.db, 
+      keyType = "SYMBOL", 
+      ont = "BP", 
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.2,
+      readable = TRUE
+    )
+    
+    kegg <- enrichKEGG(
+      gene = gene_list,
+      organism = "hsa", 
+      keyType = "kegg",
+      pAdjustMethod = "BH",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.2
+    )
+    
+    results_ora_kegg[[paste(comparison, regulation, "ORA", sep = "_")]] <- ora
+    results_ora_kegg[[paste(comparison, regulation, "KEGG", sep = "_")]] <- kegg
+  }
+}
+
+for (result_name in names(results_ora_kegg)) {
+  result <- results_ora_kegg[[result_name]]
+  if (!is.null(result) && nrow(as.data.frame(result)) > 0) {
+    write.csv(as.data.frame(result), paste0(result_name, ".csv"), row.names = FALSE)
+  }
+}
+
+for (result_name in names(results_ora_kegg)) {
+  result <- results_ora_kegg[[result_name]]
+  if (!is.null(result)) {
+    print(dotplot(result) + ggtitle(result_name) + theme_minimal())
+  }
+}
+#____________________________________________________________________________________________________________
+#____________________________________________________________________________________________________________
+#____________________________________________________________________________________________________________
+all_results_combined <- bind_rows(
+  lapply(names(results_ora_kegg), function(name) {
+    result <- results_ora_kegg[[name]]
+    if (!is.null(result) && nrow(as.data.frame(result)) > 0) {
+      data <- as.data.frame(result)
+      data$Analysis <- ifelse(grepl("ORA", name), "ORA", "KEGG")
+      data$Comparison <- strsplit(name, "_")[[1]][1] 
+      data$Regulation <- strsplit(name, "_")[[1]][2]
+      return(data)
+    } else {
+      return(NULL)
+    }
+  })
+)
+
+significant_results <- all_results_combined %>%
+  filter(p.adjust < 0.05) 
+
+remove_redundancy <- function(data) {
+  if ("geneID" %in% colnames(data)) {
+    data <- data %>%
+      rowwise() %>%
+      mutate(GeneSet = paste(sort(strsplit(geneID, "/")[[1]]), collapse = ",")) %>%
+      ungroup() %>%
+      distinct(GeneSet, .keep_all = TRUE) %>% 
+      dplyr::select(-GeneSet) 
+  }
+  return(data)
+}
+
+filtered_results <- significant_results %>%
+  group_by(Comparison, Regulation, Analysis) %>%
+  group_split() %>%
+  lapply(remove_redundancy) %>%
+  bind_rows()
+
+top_results <- filtered_results %>%
+  group_by(Comparison, Regulation, Analysis) %>%
+  slice_max(order_by = -log10(p.adjust), n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+ggplot(top_results, aes(x = reorder(Description, -log10(p.adjust)), y = -log10(p.adjust), fill = Analysis)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_grid(Comparison ~ Regulation, scales = "free", space = "free") +
+  coord_flip() +
+  labs(
+    x = "Pathway/GO Term",
+    y = "-Log10 Adjusted P-Value",
+    fill = "Analysis",
+    title = "Faceted ORA and KEGG Results (Top 10 Significant Non-Redundant Terms)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    strip.text = element_text(size = 10, face = "bold"),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+#____________________________________________________________________________________________________________
+#____________________________________________________________________________________________________________
+#____________________________________________________________________________________________________________
+all_results_combined <- all_results %>%
+  left_join(
+    AnnotationDbi::select(
+      org.Hs.eg.db,
+      keys = unique(all_results$Gene),
+      columns = c("ENTREZID"),
+      keytype = "SYMBOL"
+    ),
+    by = c("Gene" = "SYMBOL")
+  ) %>%
+  filter(!is.na(ENTREZID)) 
+
+results_ora_kegg <- list()
+
+for (comparison in comparisons) {
+  for (regulation in regulations) {
+    gene_list <- if (regulation == "Both") {
+      all_results_combined %>%
+        filter(Comparison == comparison & Regulation %in% c("Upregulated", "Downregulated")) %>%
+        pull(ENTREZID) %>%
+        unique()
+    } else {
+      all_results_combined %>%
+        filter(Comparison == comparison & Regulation == regulation) %>%
+        pull(ENTREZID) %>%
+        unique()
+    }
+    
+    if (is.null(gene_list) || length(gene_list) == 0) next
+    
+    ora <- tryCatch(
+      enrichGO(
+        gene = gene_list,
+        OrgDb = org.Hs.eg.db,
+        keyType = "ENTREZID",
+        ont = "BP",
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.05,
+        qvalueCutoff = 0.2,
+        readable = TRUE
+      ),
+      error = function(e) NULL
+    )
+    
+    kegg <- tryCatch(
+      enrichKEGG(
+        gene = gene_list,
+        organism = "hsa",
+        keyType = "kegg",
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.05,
+        qvalueCutoff = 0.2
+      ),
+      error = function(e) NULL
+    )
+    
+    results_ora_kegg[[paste(comparison, regulation, "ORA", sep = "_")]] <- ora
+    results_ora_kegg[[paste(comparison, regulation, "KEGG", sep = "_")]] <- kegg
+  }
+}
+
+for (result_name in names(results_ora_kegg)) {
+  result <- results_ora_kegg[[result_name]]
+  if (!is.null(result) && nrow(as.data.frame(result)) > 0) {
+    write.csv(as.data.frame(result), paste0(result_name, ".csv"), row.names = FALSE)
+  }
+}
+
+
+for (result_name in names(results_ora_kegg)) {
+  result <- results_ora_kegg[[result_name]]
+  
+  if (!is.null(result) && "result" %in% slotNames(result) && nrow(result@result) > 0) {
+    tryCatch({
+      print(dotplot(result, showCategory = 10) + 
+              ggtitle(result_name) +
+              theme_minimal())
+    }, error = function(e) {
+      message(paste("Error generating dotplot for", result_name, ":", e$message))
+    })
+  } else {
+    message(paste("No significant enriched terms for", result_name))
+  }
+}
+
+output_dir <- "dotplot_results"  
+dir.create(output_dir, showWarnings = FALSE)  
+
+for (result_name in names(results_ora_kegg)) {
+  result <- results_ora_kegg[[result_name]]
+    if (!is.null(result) && "result" %in% slotNames(result) && nrow(result@result) > 0) {
+    tryCatch({
+      dot_plot <- dotplot(result, showCategory = 10) +
+        ggtitle(result_name) +
+        theme_minimal()
+      
+      output_path <- file.path(output_dir, paste0(result_name, ".svg"))
+      ggsave(output_path, dot_plot, width = 4, height = 4)
+      message(paste("Saved dot plot for", result_name, "to", output_path))
+    }, error = function(e) {
+      message(paste("Error generating dot plot for", result_name, ":", e$message))
+    })
+  } else {
+    message(paste("No significant enriched terms for", result_name))
+  }
+}
+
+```
+
+# Datasets overlapping analysis and Venn Diagrams
+
+```{r datasets overlapping}
+setwd("~/USZ/Neuropathologie - Caredio Davide/Collaborations/For_Carlo/Papers/")
+
+melamed_data <- read_excel("MELAMED_siTDP_SHY5Y.xlsx")
+neurons_data <- read_excel("Neurons_TDP-43_positive_TDP-43_negative.xlsx")
+i3neurons_data <- read_excel("i3Neurons_siRNA_TDPKD.xlsx")
+
+# MELAMED data is already filtered
+melamed_genes <- melamed_data$Gene
+
+# Filter neurons_data based on FDR and log2FC criteria
+neurons_filtered <- neurons_data %>%
+  filter(fdr < 0.05, abs(`log2 Ratio`) > 0.5) %>%
+  dplyr::select(gene_name)
+neurons_genes <- neurons_filtered$gene_name
+
+# Filter i3neurons_data based on FDR and log2FC criteria
+i3neurons_filtered <- i3neurons_data %>%
+  filter(padj < 0.05, abs(log2FoldChange) > 0.5) %>%
+  dplyr::select(gene_name)
+i3neurons_genes <- i3neurons_filtered$gene_name
+
+#Prepare gene lists for overlap
+gene_lists <- list(
+  "MELAMED_siTDP_SHY5Y" = melamed_genes,
+  "Neurons_TDP-43_Positive_Negative" = neurons_genes,
+  "i3Neurons_siRNA_TDPKD" = i3neurons_genes
+)
+
+#Visualize overlaps with a Venn diagram
+venn_plot <- ggvenn(gene_lists, fill_color = c("#E69F00", "#56B4E9", "#009E73"))
+
+#ggsave("DEGs_Venn_Diagram.png", venn_plot, width = 8, height = 6)
+print(venn_plot)
+#____________________________________________________________________________________________________________
+#____________________________________________________________________________________________________________
+#____________________________________________________________________________________________________________
+extract_degs <- function(comparison_name) {
+  all_results_combined %>%
+    filter(Comparison == comparison_name, padj < 0.05, abs(log2FoldChange) > 0.5) %>%
+    pull(Gene) %>%
+    unique()
+}
+
+mscarlet_vs_negative_genes <- extract_degs("mScarlet vs Negative")
+atto_vs_negative_genes <- extract_degs("Atto vs Negative")
+mscarlet_vs_atto_genes <- extract_degs("mScarlet vs Atto")
+
+all_genes <- unique(c(
+  melamed_genes,
+  neurons_genes,
+  i3neurons_genes,
+  mscarlet_vs_negative_genes,
+  atto_vs_negative_genes,
+  mscarlet_vs_atto_genes
+))
+
+universe_size <- length(all_genes)
+cat("Universe size calculated dynamically:", universe_size, "\n")
+
+# Step 5: Perform Fisher's Exact Test for pairwise comparisons
+perform_fisher_test <- function(set1, set2, universe) {
+  overlap <- length(intersect(set1, set2))
+  only_in_set1 <- length(set1) - overlap
+  only_in_set2 <- length(set2) - overlap
+  neither <- universe - length(set1) - length(set2) + overlap
+  
+  contingency_table <- matrix(c(overlap, only_in_set1, only_in_set2, neither), nrow = 2)
+  
+  test_result <- fisher.test(contingency_table)
+  
+  return(list(p_value = test_result$p.value, overlap = overlap))
+}
+
+datasets <- list(
+  "Melamed et al., 2019" = melamed_genes,
+  "Liu et al., 2019" = neurons_genes,
+  "Seddighi et al., 2024" = i3neurons_genes,
+  "mScarlet vs Negative" = mscarlet_vs_negative_genes,
+  "Atto vs Negative" = atto_vs_negative_genes,
+  "mScarlet vs Atto" = mscarlet_vs_atto_genes
+)
+
+significant_overlaps <- list()
+pairwise_results <- combn(names(datasets), 2, function(pair) {
+  set1 <- datasets[[pair[1]]]
+  set2 <- datasets[[pair[2]]]
+  
+  test_result <- perform_fisher_test(set1, set2, universe_size)
+  
+  if (test_result$p_value < 0.05) {
+    significant_overlaps[[paste(pair, collapse = " vs ")]] <- test_result
+  }
+  
+  return(data.frame(
+    Pair = paste(pair, collapse = " vs "),
+    Overlap = test_result$overlap,
+    PValue = test_result$p_value
+  ))
+}, simplify = FALSE)
+
+pairwise_results_df <- do.call(rbind, pairwise_results)
+
+#write.xlsx(pairwise_results_df, file = "Overlap_Fisher_Exact_test.xlsx", rowNames = FALSE)
+
+significant_results_df <- pairwise_results_df %>% filter(PValue < 0.05)
+cat("Significant overlaps detected:\n")
+print(significant_results_df)
+
+plots <- list()
+
+comparison_gene_lists <- list(
+  "mScarlet vs Negative" = mscarlet_vs_negative_genes,
+  "Atto vs Negative" = atto_vs_negative_genes,
+  "mScarlet vs Atto" = mscarlet_vs_atto_genes
+)
+
+for (comparison_name in names(comparison_gene_lists)) {
+  comparison_genes <- comparison_gene_lists[[comparison_name]]
+  
+  gene_lists <- list(
+    "Melamed et al., 2019" = melamed_genes,
+    "Liu et al., 2019" = neurons_genes,
+    "Seddighi et al., 2024" = i3neurons_genes,
+    comparison_name = comparison_genes
+  )
+  
+  venn_plot <- ggvenn(
+    data = gene_lists,
+    fill_color = c("#E69F00", "#56B4E9", "#009E73", "#CC79A7"),
+    stroke_size = 0.5,
+    show_percentage = FALSE
+  ) +
+    ggtitle(paste("Venn Diagram:", comparison_name))
+  
+  for (pair in rownames(significant_results_df)) {
+    if (grepl(comparison_name, pair)) {
+      overlap_count <- significant_results_df[pair, "Overlap"]
+      venn_plot <- venn_plot +
+        annotate(
+          "text",
+          x = 0.5, y = 0.5, 
+          label = paste("Overlap:", overlap_count),
+          color = "red",
+          size = 5
+        )
+    }
+  }
+  
+  plots[[comparison_name]] <- venn_plot
+}
+
+faceted_venn <- wrap_plots(plots, ncol = 1)
+print(faceted_venn)
+
+# ggsave("Significant_Faceted_DEGs_Venn_Diagram.svg", faceted_venn, width = 8, height = 6)
+#____________________________________________________________________________________________________________
+#____________________________________________________________________________________________________________
+#____________________________________________________________________________________________________________
+normalize_genes <- function(genes) {
+  genes <- trimws(genes)    
+  genes <- toupper(genes)   
+  unique(genes)             
+}
+
+extract_degs <- function(comparison_name) {
+  all_results_combined %>%
+    filter(Comparison == comparison_name, padj < 0.05, abs(log2FoldChange) > 0.5) %>%
+    pull(Gene) %>%
+    normalize_genes()
+}
+
+mscarlet_vs_negative_genes <- extract_degs("mScarlet vs Negative")
+atto_vs_negative_genes <- extract_degs("Atto vs Negative")
+mscarlet_vs_atto_genes <- extract_degs("mScarlet vs Atto")
+
+datasets <- list(
+  "Melamed_et_al_2019" = normalize_genes(melamed_genes),
+  "Liu_et_al_2019" = normalize_genes(neurons_genes),
+  "Seddighi_et_al_2024" = normalize_genes(i3neurons_genes),
+  "mScarlet_vs_Negative" = mscarlet_vs_negative_genes,
+  "Atto_vs_Negative" = atto_vs_negative_genes,
+  "mScarlet_vs_Atto" = mscarlet_vs_atto_genes
+)
+
+perform_fisher_test <- function(set1, set2, universe) {
+  overlap <- length(intersect(set1, set2))
+  only_in_set1 <- length(set1) - overlap
+  only_in_set2 <- length(set2) - overlap
+  neither <- universe - length(set1) - length(set2) + overlap
+  
+  contingency_table <- matrix(c(overlap, only_in_set1, only_in_set2, neither), nrow = 2)
+  test_result <- fisher.test(contingency_table)
+  
+  return(list(p_value = test_result$p.value, overlap = overlap))
+}
+
+all_genes <- unique(unlist(datasets))
+universe_size <- length(all_genes)
+cat("Universe size:", universe_size, "\n")
+
+overlap_gene_lists <- list()
+pairwise_results <- combn(names(datasets), 2, function(pair) {
+  set1 <- datasets[[pair[1]]]
+  set2 <- datasets[[pair[2]]]
+  
+  overlap_genes <- intersect(set1, set2)
+  overlap_size <- length(overlap_genes)
+  cat("\nComparing:", pair[1], "vs", pair[2], "\n")
+  cat("Overlap size:", overlap_size, "\n")
+  
+  if (overlap_size > 0) {
+    test_result <- perform_fisher_test(set1, set2, universe_size)
+    
+    pair_name <- paste(pair[1], pair[2], sep = "_vs_")
+    overlap_gene_lists[[pair_name]] <<- overlap_genes
+    
+    cat("Stored genes for pair:", pair_name, "\n")
+    
+    return(data.frame(
+      Pair = paste(pair, collapse = " vs "),
+      Overlap = overlap_size,
+      PValue = test_result$p_value
+    ))
+  } else {
+    return(data.frame(
+      Pair = paste(pair, collapse = " vs "),
+      Overlap = 0,
+      PValue = NA
+    ))
+  }
+}, simplify = FALSE)
+
+pairwise_results_df <- do.call(rbind, pairwise_results)
+
+significant_results_df <- pairwise_results_df %>% filter(!is.na(PValue) & PValue < 0.05)
+cat("\nSignificant overlaps:\n")
+print(significant_results_df)
+
+if (length(overlap_gene_lists) > 0) {
+  for (pair in names(overlap_gene_lists)) {
+    file_name <- paste0("overlapping_genes_", pair, ".txt")
+    writeLines(overlap_gene_lists[[pair]], file_name)
+    cat("Saved:", file_name, "\n")
+  }
+} else {
+  cat("No overlapping genes to save.\n")
+}
+
+# write.csv(pairwise_results_df, "Fisher_Exact_Test_Results.csv", row.names = FALSE)
+# cat("Results saved to Fisher_Exact_Test_Results.csv\n")
+# cat("\nOverlapping Genes Lists:\n")
+# print(overlap_gene_lists)
+
+
+# # Step 1: Load the datasets
+# melamed_data <- read_excel("MELAMED_siTDP_SHY5Y.xlsx")
+# neurons_data <- read_excel("Neurons_TDP-43_positive_TDP-43_negative.xlsx")
+# i3neurons_data <- read_excel("i3Neurons_siRNA_TDPKD.xlsx")
+# 
+# # Step 2: Filter datasets for upregulated and downregulated genes
+# # MELAMED genes (already filtered)
+# melamed_genes <- melamed_data$Gene
+# 
+# # Neurons: Upregulated and Downregulated
+# neurons_upregulated <- neurons_data %>%
+#   filter(fdr < 0.05, `log2 Ratio` > 0.5) %>%
+#   pull(gene_name)
+# 
+# neurons_downregulated <- neurons_data %>%
+#   filter(fdr < 0.05, `log2 Ratio` < -0.5) %>%
+#   pull(gene_name)
+# 
+# # i3Neurons: Upregulated and Downregulated
+# i3neurons_upregulated <- i3neurons_data %>%
+#   filter(padj < 0.05, log2FoldChange > 0.5) %>%
+#   pull(gene_name)
+# 
+# i3neurons_downregulated <- i3neurons_data %>%
+#   filter(padj < 0.05, log2FoldChange < -0.5) %>%
+#   pull(gene_name)
+# 
+# # Step 3: Extract DEGs for all comparisons
+# extract_degs <- function(comparison_name, direction) {
+#   all_results_combined %>%
+#     filter(
+#       Comparison == comparison_name,
+#       padj < 0.05,
+#       if (direction == "up") log2FoldChange > 0.5 else log2FoldChange < -0.5
+#     ) %>%
+#     pull(Gene) %>%
+#     unique()
+# }
+# 
+# # Extract upregulated and downregulated genes for all comparisons
+# atto_vs_negative_up <- extract_degs("Atto vs Negative", "up")
+# atto_vs_negative_down <- extract_degs("Atto vs Negative", "down")
+# 
+# mscarlet_vs_negative_up <- extract_degs("mScarlet vs Negative", "up")
+# mscarlet_vs_negative_down <- extract_degs("mScarlet vs Negative", "down")
+# 
+# mscarlet_vs_atto_up <- extract_degs("mScarlet vs Atto", "up")
+# mscarlet_vs_atto_down <- extract_degs("mScarlet vs Atto", "down")
+# 
+# # Step 4: Create Venn diagrams for upregulated and downregulated genes
+# comparison_lists_up <- list(
+#   `Atto vs Negative` = atto_vs_negative_up,
+#   `mScarlet vs Negative` = mscarlet_vs_negative_up,
+#   `mScarlet vs Atto` = mscarlet_vs_atto_up
+# )
+# 
+# comparison_lists_down <- list(
+#   `Atto vs Negative` = atto_vs_negative_down,
+#   `mScarlet vs Negative` = mscarlet_vs_negative_down,
+#   `mScarlet vs Atto` = mscarlet_vs_atto_down
+# )
+# 
+# # Helper function to create Venn diagrams
+# create_venn <- function(comparison_genes, title) {
+#   gene_lists <- list(
+#     "MELAMED siTDP SHY5Y" = melamed_genes,
+#     "Neurons TDP-43 Positive/Negative" = neurons_upregulated,
+#     "i3Neurons siRNA TDPKD" = i3neurons_upregulated
+#   )
+#   gene_lists[[title]] <- comparison_genes
+#   
+#   ggvenn(gene_lists, fill_color = c("#E69F00", "#56B4E9", "#009E73", "#CC79A7")) +
+#     ggtitle(title) +
+#     theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12))
+# }
+# 
+# # Generate upregulated Venn diagrams
+# venn_up <- lapply(names(comparison_lists_up), function(name) {
+#   create_venn(comparison_lists_up[[name]], paste(name, "Upregulated"))
+# })
+# 
+# # Generate downregulated Venn diagrams
+# venn_down <- lapply(names(comparison_lists_down), function(name) {
+#   create_venn(comparison_lists_down[[name]], paste(name, "Downregulated"))
+# })
+# 
+# # Combine all Venn diagrams into a faceted grid
+# library(patchwork)
+# faceted_venn <- wrap_plots(c(venn_up, venn_down), nrow = 2)
+# 
+# # Step 5: Save and display the faceted Venn diagrams
+# # ggsave("Faceted_Venn_Diagrams.png", faceted_venn, width = 12, height = 18)  # Save commented out
+# 
+# # Display the faceted Venn diagram
+# print(faceted_venn)
+```
+
+# WGCNA analysis
+
+```{r wgcna}
+setwd("~/USZ/Neuropathologie - Caredio Davide/Collaborations/For_Carlo")
+
+if (anyDuplicated(rownames(filtered_raw_counts)) > 0) {
+  rownames(filtered_raw_counts) <- make.unique(rownames(filtered_raw_counts))
+}
+
+original_gene_names <- rownames(filtered_raw_counts)
+colnames(filtered_raw_counts) <- gsub("\\[normalized count\\]", "", colnames(filtered_raw_counts))
+
+data <- as.data.frame(filtered_raw_counts)
+rownames(data) <- rownames(filtered_raw_counts)
+data <- as.matrix(data)
+
+data_t <- t(data)
+
+rownames(data_t) <- trimws(rownames(data_t))
+
+
+atto_vs_negative <- data_t[rownames(data_t) %in% c("Negative_1", "Negative_2", "Negative_3", "Atto_1", "Atto_2", "Atto_3"), ]
+mscarlet_vs_negative <- data_t[rownames(data_t) %in% c("Negative_1", "Negative_2", "Negative_3", "mScarlet_1", "mScarlet_2", "mScarlet_3"), ]
+mscarlet_vs_atto <- data_t[rownames(data_t) %in% c("Atto_1", "Atto_2", "Atto_3", "mScarlet_1", "mScarlet_2", "mScarlet_3"), ]
+
+# # Step 4: Define WGCNA processing function
+# process_wgcna <- function(data_subset, group_labels) {
+#   # Debug: Print input dimensions and structure
+#   print("Debug: Dimensions of data_subset:")
+#   print(dim(data_subset))
+#   print("Debug: Row names of data_subset:")
+#   print(rownames(data_subset))
+#   print("Debug: Column names of data_subset:")
+#   print(colnames(data_subset))
+#   
+#   # Check group labels
+#   if (length(group_labels) != nrow(data_subset)) {
+#     stop("Mismatch between the number of samples and group labels.")
+#   }
+#   
+#   # WGCNA pipeline
+#   powers <- c(1:20)
+#   sft <- pickSoftThreshold(data_subset, powerVector = powers, verbose = 5)
+#   soft_power <- sft$powerEstimate
+#   adjacency <- adjacency(data_subset, power = soft_power)
+#   TOM <- TOMsimilarity(adjacency)
+#   dissTOM <- 1 - TOM
+#   gene_tree <- hclust(as.dist(dissTOM), method = "average")
+#   min_module_size <- 30
+#   dynamic_modules <- cutreeDynamic(dendro = gene_tree, distM = dissTOM,
+#                                    deepSplit = 2, pamRespectsDendro = FALSE,
+#                                    minClusterSize = min_module_size)
+#   module_colors <- labels2colors(dynamic_modules)
+#   
+#   # Relate modules to traits
+#   trait_data <- data.frame(
+#     Sample = rownames(data_subset),
+#     Group = group_labels
+#   )
+#   
+#   MEs <- moduleEigengenes(data_subset, colors = module_colors)$eigengenes
+#   
+#   module_trait_correlation <- cor(MEs, as.numeric(factor(trait_data$Group)), use = "pairwise.complete.obs")
+#   module_trait_pvalues <- corPvalueStudent(module_trait_correlation, nrow(data_subset))
+#   
+#   # Create heatmap data
+#   heatmap_data <- data.frame(
+#     Module = rownames(module_trait_correlation),
+#     Correlation = as.vector(module_trait_correlation),
+#     pvalue = as.vector(module_trait_pvalues)
+#   )
+#   
+#   return(list(modules = dynamic_modules, MEs = MEs, heatmap_data = heatmap_data))
+# }
+# 
+
+
+process_wgcna <- function(data_subset, group_labels) {
+  print("Debug: Dimensions of data_subset:")
+  print(dim(data_subset))
+  print("Debug: Row names of data_subset:")
+  print(rownames(data_subset))
+  print("Debug: Column names of data_subset:")
+  print(colnames(data_subset))
+  
+  if (length(group_labels) != nrow(data_subset)) {
+    stop("Mismatch between the number of samples and group labels.")
+  }
+  
+  powers <- c(1:20)
+  sft <- pickSoftThreshold(data_subset, powerVector = powers, verbose = 5)
+  soft_power <- sft$powerEstimate
+  if (is.null(soft_power)) stop("Failed to estimate soft thresholding power.")
+  
+  adjacency <- adjacency(data_subset, power = soft_power)
+  TOM <- TOMsimilarity(adjacency)
+  dissTOM <- 1 - TOM
+  gene_tree <- hclust(as.dist(dissTOM), method = "average")
+  min_module_size <- 30
+  
+  dynamic_modules <- cutreeDynamic(
+    dendro = gene_tree, distM = dissTOM,
+    deepSplit = 2, pamRespectsDendro = FALSE,
+    minClusterSize = min_module_size
+  )
+  
+  module_colors <- labels2colors(dynamic_modules)
+  print("Debug: Length of module_colors:")
+  print(length(module_colors))
+  
+  if (length(module_colors) != ncol(data_subset)) {
+    stop("Mismatch between the number of genes (columns in data_subset) and module assignments (module_colors).")
+  }
+  
+  trait_data <- data.frame(
+    Sample = rownames(data_subset),
+    Group = group_labels
+  )
+  
+  MEs <- moduleEigengenes(data_subset, colors = module_colors)$eigengenes
+  
+  module_trait_correlation <- cor(
+    MEs, as.numeric(factor(trait_data$Group)),
+    use = "pairwise.complete.obs"
+  )
+  module_trait_pvalues <- corPvalueStudent(module_trait_correlation, nrow(data_subset))
+  
+  heatmap_data <- data.frame(
+    Module = colnames(MEs), 
+    Correlation = as.vector(module_trait_correlation),
+    pvalue = as.vector(module_trait_pvalues)
+  )
+  
+  gene_module_assignment <- data.frame(
+    Gene = colnames(data_subset), 
+    Module = module_colors        
+  )
+  
+  return(list(
+    modules = gene_module_assignment,  
+    MEs = MEs,                         
+    heatmap_data = heatmap_data        
+  ))
+}
+
+
+atto_vs_negative_result <- process_wgcna(atto_vs_negative, group_labels = c(rep("Negative", 3), rep("Atto", 3)))
+mscarlet_vs_negative_result <- process_wgcna(mscarlet_vs_negative, group_labels = c(rep("Negative", 3), rep("mScarlet", 3)))
+mscarlet_vs_atto_result <- process_wgcna(mscarlet_vs_atto, group_labels = c(rep("Atto", 3), rep("mScarlet", 3)))
+
+
+significance_threshold <- 0.05
+
+significant_modules_atto <- atto_vs_negative_result$heatmap_data %>%
+  filter(pvalue < significance_threshold)
+
+significant_modules_mscarlet <- mscarlet_vs_negative_result$heatmap_data %>%
+  filter(pvalue < significance_threshold)
+
+significant_modules_atto_mscarlet <- mscarlet_vs_atto_result$heatmap_data %>%
+  filter(pvalue < significance_threshold)
+
+extract_genes_for_modules <- function(comparison_name, significant_modules, module_data) {
+  module_list <- list()
+  for (module in significant_modules$Module) {
+    genes_in_module <- module_data %>%
+      filter(Module == gsub("ME", "", module)) 
+    
+    if (nrow(genes_in_module) == 0) {
+      genes_in_module <- data.frame(Gene = character(0), Module = character(0))
+    }
+    
+    module_list[[module]] <- genes_in_module
+  }
+  
+  return(module_list)
+}
+
+comparison_results <- list()
+
+comparison_results[["Atto vs Negative"]] <- extract_genes_for_modules(
+  "Atto vs Negative",
+  significant_modules_atto,
+  atto_vs_negative_result$modules
+)
+
+comparison_results[["mScarlet vs Negative"]] <- extract_genes_for_modules(
+  "mScarlet vs Negative",
+  significant_modules_mscarlet,
+  mscarlet_vs_negative_result$modules
+)
+
+comparison_results[["mScarlet vs Atto"]] <- extract_genes_for_modules(
+  "mScarlet vs Atto",
+  significant_modules_atto_mscarlet,
+  mscarlet_vs_atto_result$modules
+)
+
+```
+
+# WGCNA modules plot
+
+```{r wgcna modules plot}
+all_plot_data <- bind_rows(
+  lapply(c("Atto vs Negative", "mScarlet vs Negative", "mScarlet vs Atto"), function(comp_name) {
+    if (comp_name == "Atto vs Negative") {
+      significant_modules <- significant_modules_atto
+      result <- atto_vs_negative_result
+    } else if (comp_name == "mScarlet vs Negative") {
+      significant_modules <- significant_modules_mscarlet
+      result <- mscarlet_vs_negative_result
+    } else {
+      significant_modules <- significant_modules_atto_mscarlet
+      result <- mscarlet_vs_atto_result
+    }
+    
+    if (nrow(significant_modules) == 0) {
+      return(NULL) 
+    }
+    
+    do.call(rbind, lapply(significant_modules$Module, function(module) {
+      if (!module %in% colnames(result$MEs)) {
+        stop(paste("Module", module, "not found in eigengene data for", comp_name))
+      }
+      
+      eigengene_data <- result$MEs[, module, drop = FALSE]
+      
+      group_labels <- c(rep("Group1", nrow(eigengene_data) / 2), rep("Group2", nrow(eigengene_data) / 2))
+      
+      data.frame(
+        Comparison = comp_name,
+        Group = group_labels,
+        Eigengene = eigengene_data[, 1], 
+        Module = module
+      )
+    }))
+  })
+)
+
+
+plot_single_comparison_with_pvalues <- function(plot_data, comparison_name, significance_modules) {
+  comparison_data <- plot_data[plot_data$Comparison == comparison_name, ]
+  comparison_data <- merge(
+    comparison_data, 
+    significance_modules[, c("Module", "pvalue")], 
+    by = "Module"
+  )
+  
+  ggplot(comparison_data, aes(x = Group, y = Eigengene, fill = Group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) + 
+    geom_jitter(width = 0.2, size = 1, alpha = 0.8) + 
+    facet_wrap(~ Module, scales = "free_y") +
+    geom_segment(
+      data = unique(comparison_data[, c("Module", "pvalue")]),
+      aes(
+        x = 1, xend = 2, 
+        y = max(comparison_data$Eigengene) + 0.1, 
+        yend = max(comparison_data$Eigengene) + 0.1
+      ),
+      inherit.aes = FALSE
+    ) +
+    geom_text(
+      data = unique(comparison_data[, c("Module", "pvalue")]),
+      aes(
+        x = 1.5,
+        y = max(comparison_data$Eigengene) + 0.15, 
+        label = paste0("p = ", format(pvalue, digits = 3))
+      ),
+      inherit.aes = FALSE,
+      size = 3
+    ) +
+    labs(
+      title = paste("Eigengene Boxplots for Significant Modules in", comparison_name),
+      x = "Group",
+      y = "Eigengene"
+    ) +
+    theme_bw() +
+    theme(
+      strip.text = element_text(size = 8),
+      legend.position = "none",           
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank()  
+    )
+}
+
+atto_plot <- plot_single_comparison_with_pvalues(all_plot_data, "Atto vs Negative", significant_modules_atto)
+mscarlet_plot <- plot_single_comparison_with_pvalues(all_plot_data, "mScarlet vs Negative", significant_modules_mscarlet)
+atto_mscarlet_plot <- plot_single_comparison_with_pvalues(all_plot_data, "mScarlet vs Atto", significant_modules_atto_mscarlet)
+
+# svg("Atto_vs_Negative_Boxplots.svg", width = 10, height = 12) 
+# print(atto_plot)
+# dev.off()
+# 
+# svg("mScarlet_vs_Negative_Boxplots.svg", width = 10, height = 8) 
+# print(mscarlet_plot)
+# dev.off()
+# 
+# svg("mScarlet_vs_Atto_Boxplots.svg", width = 10, height = 8)  
+# print(atto_mscarlet_plot)
+# dev.off()
+```
+
+# GO pathway analysis on modules
+
+```{r GO analysis on modules}
+prepare_pathway_genes <- function(comparison_results) {
+  pathway_genes <- list()
+  
+  for (comparison_name in names(comparison_results)) {
+    comparison_modules <- comparison_results[[comparison_name]]
+    for (module_name in names(comparison_modules)) {
+      genes <- comparison_modules[[module_name]]$Gene
+      pathway_genes[[paste(comparison_name, module_name, sep = "_")]] <- genes
+    }
+  }
+  
+  return(pathway_genes)
+}
+
+pathway_genes <- prepare_pathway_genes(comparison_results)
+
+
+perform_enrichment <- function(genes, organism = "org.Hs.eg.db", ont = "BP") {
+  gene_ids <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = organism)
+  
+  if (nrow(gene_ids) == 0) {
+    return(NULL)  
+  }
+  
+  go_enrich <- enrichGO(
+    gene          = gene_ids$ENTREZID,
+    OrgDb         = organism,
+    ont           = ont, 
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.05,
+    readable      = TRUE
+  )
+  
+  return(go_enrich)
+}
+
+enrichment_results <- list()
+
+for (module_name in names(pathway_genes)) {
+  cat("Performing enrichment for", module_name, "...\n")
+  enrichment_results[[module_name]] <- perform_enrichment(pathway_genes[[module_name]])
+}
+
+
+visualize_enrichment <- function(enrich_result, module_name) {
+  if (!is.null(enrich_result)) {
+    dotplot(enrich_result, showCategory = 10) + 
+      ggtitle(paste("Pathway Enrichment for", module_name))
+  } else {
+    cat("No enrichment results for", module_name, "\n")
+  }
+}
+
+for (module_name in names(enrichment_results)) {
+  visualize_enrichment(enrichment_results[[module_name]], module_name)
+}
+```
+
+
+# KEGG analysis on modules
+
+```{r kegg analysis on modules}
+perform_kegg <- function(genes, organism = "hsa") {
+  gene_ids <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+  
+  if (nrow(gene_ids) == 0) {
+    return(NULL)
+  }
+  
+  kegg_enrich <- enrichKEGG(
+    gene          = gene_ids$ENTREZID,
+    organism      = organism,
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05
+  )
+  
+  return(kegg_enrich)
+}
+
+kegg_results <- list()
+
+for (module_name in names(pathway_genes)) {
+  cat("Performing KEGG enrichment for", module_name, "...\n")
+  kegg_results[[module_name]] <- perform_kegg(pathway_genes[[module_name]])
+}
+
+kegg_mered <- kegg_results[["MEred"]]
+
+if (!is.null(kegg_mered)) {
+  kegg_df <- as.data.frame(kegg_mered)
+  kegg_plot <- ggplot(kegg_df, aes(x = reorder(Description, -p.adjust), y = -log10(p.adjust))) +
+    geom_bar(stat = "identity", fill = "red") +
+    coord_flip() +
+    labs(
+      x = "KEGG Pathway",
+      y = "-log10 Adjusted p-value",
+      title = "KEGG Pathway Enrichment for MEred"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10)
+    )
+  
+  print(kegg_plot)
+  
+  # ggsave("KEGG_MEred.png", kegg_plot, width = 8, height = 6)
+} else {
+  cat("No significant KEGG enrichment results for MEred.\n")
+}
+
+kegg_mered <- kegg_results[["mScarlet vs Atto_MEred"]]
+
+if (!is.null(kegg_mered)) {
+    dot_plot <- dotplot(
+    kegg_mered,
+    showCategory = 10,        
+    x = "GeneRatio",           
+    color = "p.adjust",        
+    size = "Count"            
+  ) +
+    labs(
+      x = "Gene Ratio",
+      y = "KEGG Pathway"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 12, face = "bold"),
+      plot.margin = margin(10, 30, 10, 10)
+    ) +
+    coord_cartesian(clip = "off") 
+  
+  output_path <- "KEGG_MEred_DotPlot_fixed.svg"
+  
+  ggsave("KEGG_MEred_DotPlot.tiff", dot_plot, width = 5, height = 3.5)
+  print(dot_plot)  
+  dev.off()        
+  
+  cat("KEGG dot plot successfully saved to:", output_path, "\n")
+  
+} else {
+  cat("No significant KEGG enrichment results for mScarlet vs Atto (MEred).\n")
+}
+
+
+kegg_results_df <- as.data.frame(kegg_mered@result)
+kegg_results_df <- kegg_results_df %>%
+  mutate(
+    GeneSymbols = sapply(strsplit(geneID, "/"), function(ids) {
+      symbols <- mapIds(org.Hs.eg.db, keys = ids, column = "SYMBOL", keytype = "ENTREZID", multiVals = "first")
+      paste(symbols, collapse = ", ")
+    })
+  )
+output_file <- "Updated_KEGG_Enrichment_with_GeneSymbols.xlsx"
+write_xlsx(kegg_results_df, output_file)
+
+cat("Updated KEGG enrichment results with gene symbols saved to:", output_file, "\n")
+```
+
+# Circular plot of red module
+
+```{r circular plot}
+comparison_results <- lapply(comparison_results, function(comp) {
+  lapply(comp, function(module_data) {
+    module_data %>%
+      filter(!grepl("^\\.", Gene))
+  })
+})
+
+module_genes <- comparison_results[["mScarlet vs Atto"]][["MEred"]]$Gene
+module_genes_df <- data.frame(Gene = module_genes)
+# output_file <- "module_genes_red_mScarlet_vs_Atto.xlsx"
+# write_xlsx(module_genes_df, output_file)
+
+
+data_t_mscarlet_atto <- data_t[4:9, ] 
+adjacency_matrix <- cor(data_t_mscarlet_atto[, module_genes], use = "pairwise.complete.obs")
+threshold <- 0.75  
+filtered_adjacency <- adjacency_matrix
+filtered_adjacency[abs(filtered_adjacency) < threshold] <- 0
+filtered_adjacency[is.na(filtered_adjacency)] <- 0  
+filtered_adjacency <- abs(filtered_adjacency)  
+
+graph <- graph_from_adjacency_matrix(filtered_adjacency, mode = "undirected", weighted = TRUE, diag = FALSE)
+V(graph)$importance <- degree(graph)
+sorted_vertices <- V(graph)[order(V(graph)$importance, decreasing = TRUE)]
+top_nodes <- head(sorted_vertices, 20)
+graph_top <- induced_subgraph(graph, vids = top_nodes)
+V(graph_top)$color <- scales::col_numeric(
+  palette = c("lightyellow", "orange", "red"), 
+  domain = range(V(graph_top)$importance, na.rm = TRUE)
+)(V(graph_top)$importance)
+
+V(graph_top)$label.color <- ifelse(
+  V(graph_top)$importance > (max(V(graph_top)$importance) * 0.7), 
+  "black",  
+  "black"  
+)
+
+V(graph_top)$size <- 15 + 10 * (V(graph_top)$importance / max(V(graph_top)$importance, na.rm = TRUE))
+V(graph_top)$label.cex <- 0.6  
+
+# svg("mScarlet_vs_Atto_MEred_Network.svg", width = 5, height = 5)  
+importance_range <- range(V(graph_top)$importance, na.rm = TRUE)
+
+plot(
+  graph_top,
+  layout = layout_in_circle(graph_top),
+  vertex.size = V(graph_top)$size,
+  vertex.color = V(graph_top)$color,
+  vertex.label = V(graph_top)$name,
+  vertex.label.cex = V(graph_top)$label.cex,
+  vertex.label.color = V(graph_top)$label.color,
+  edge.width = E(graph_top)$weight * 0.5, 
+  edge.color = "grey70"
+)
+
+par(xpd = TRUE)  
+legend_gradient <- seq(importance_range[1], importance_range[2], length.out = 5)
+legend_colors <- scales::col_numeric(
+  palette = c("lightyellow", "orange", "red"),
+  domain = importance_range
+)(legend_gradient)
+
+legend(
+  "topright",  
+  legend = round(legend_gradient, 2),  
+  fill = legend_colors,  
+  title = "Node Importance\n(Degree Centrality)",
+  border = NA,
+  bty = "n",
+  cex = 0.8
+)
+```
+
+
+
